@@ -64,12 +64,14 @@ final class Rule
     ];
 
     /**
-     * @param string $action One of keep, null, constant, fake, secret, custom.
-     * @param mixed $argument The constant, the fake kind or the closure.
+     * @param string $action One of keep, unreviewed, null, constant, fake, secret, custom, expression.
+     * @param mixed $argument The constant, the fake kind, the closure or the SQL expression.
+     * @param \Closure|array<string|int, mixed>|null $conditions Only rows matching these are rewritten.
      */
     private function __construct(
         public readonly string $action,
         public readonly mixed $argument = null,
+        public readonly Closure|array|null $conditions = null,
     ) {
     }
 
@@ -81,6 +83,51 @@ final class Rule
     public static function keep(): self
     {
         return new self('keep');
+    }
+
+    /**
+     * Kept for now, but nobody has decided yet whether it can hold personal
+     * data. Behaves as `keep()`; `DbSanitizer::unreviewedColumns()` lists them,
+     * so an application can make sure the list only shrinks.
+     *
+     * @return self
+     */
+    public static function unreviewed(): self
+    {
+        return new self('unreviewed');
+    }
+
+    /**
+     * Set the value to the result of an SQL expression over the row, in one
+     * UPDATE for the whole table: for tables too big to rewrite row by row.
+     * The expression is written by the application, never from data. Rows
+     * whose value is null or empty are left as they are.
+     *
+     *     Rule::expression("CONCAT('contact', id, '@example.test')")
+     *
+     * @param string $sql The expression.
+     * @return self
+     */
+    public static function expression(string $sql): self
+    {
+        if (trim($sql) === '') {
+            throw new InvalidArgumentException('The expression is empty.');
+        }
+
+        return new self('expression', $sql);
+    }
+
+    /**
+     * This rule, applied only to the rows matching the conditions: a CakePHP
+     * conditions array (values are bound), or a closure that gets the
+     * connection and returns one, for a condition with a subquery.
+     *
+     * @param \Closure(\Cake\Database\Connection): array<string|int, mixed>|array<string|int, mixed> $conditions The conditions.
+     * @return self
+     */
+    public function onlyWhere(Closure|array $conditions): self
+    {
+        return new self($this->action, $this->argument, $conditions);
     }
 
     /**
@@ -151,7 +198,27 @@ final class Rule
      */
     public function isKeep(): bool
     {
-        return $this->action === 'keep';
+        return $this->action === 'keep' || $this->action === 'unreviewed';
+    }
+
+    /**
+     * Whether the column is kept only until somebody reviews it.
+     *
+     * @return bool
+     */
+    public function isUnreviewed(): bool
+    {
+        return $this->action === 'unreviewed';
+    }
+
+    /**
+     * Whether the rule is applied by one UPDATE rather than row by row.
+     *
+     * @return bool
+     */
+    public function isBulk(): bool
+    {
+        return in_array($this->action, ['expression', 'constant', 'null', 'secret'], true);
     }
 
     /**

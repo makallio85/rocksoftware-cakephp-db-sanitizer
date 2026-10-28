@@ -5,8 +5,10 @@ namespace RockSoftware\DbSanitizer;
 
 use Cake\Core\Configure;
 use Cake\Database\Connection;
+use Cake\Database\Expression\QueryExpression;
 use Cake\I18n\DateTime;
 use Cake\Utility\Security;
+use Closure;
 use InvalidArgumentException;
 use RockSoftware\DbSanitizer\Faker\DeterministicFaker;
 use RuntimeException;
@@ -30,14 +32,6 @@ class DbSanitizer
 
     /** Rows read and written per round trip. */
     public const CHUNK = 500;
-
-    /**
-     * Column types that can hold personal data, so the coverage check asks
-     * for a declaration of each one in a masked table.
-     *
-     * @var array<int, string>
-     */
-    public const TEXT_TYPES = ['string', 'char', 'text', 'json'];
 
     private DeterministicFaker $faker;
 
@@ -113,9 +107,12 @@ class DbSanitizer
             }
             $describe = $schema->describe($table);
             $rules = $declared[$table]->columns();
+            $safeTypes = $this->plan()->safeTypeList();
+            $primaryKey = $describe->getPrimaryKey();
             foreach ($describe->columns() as $column) {
                 $type = (string)$describe->getColumnType($column);
-                if (!isset($rules[$column]) && in_array($type, self::TEXT_TYPES, true)) {
+                $needsRule = !in_array($type, $safeTypes, true) && !in_array($column, $primaryKey, true);
+                if (!isset($rules[$column]) && $needsRule) {
                     $gaps[] = sprintf('Column "%s.%s" (%s) has no rule.', $table, $column, $type);
                 }
             }
@@ -125,8 +122,8 @@ class DbSanitizer
                 }
             }
         }
-        foreach (array_keys($declared) as $table) {
-            if (!in_array($table, $existing, true)) {
+        foreach ($declared as $table => $plan) {
+            if (!in_array($table, $existing, true) && !$plan->isProductionOnly()) {
                 $gaps[] = sprintf('Table "%s" is declared but does not exist.', $table);
             }
         }
@@ -151,14 +148,20 @@ class DbSanitizer
             );
         }
 
+        $existing = $connection->getSchemaCollection()->listTables();
         $changed = [];
         foreach ($this->plan()->tables() as $table => $plan) {
-            if ($plan->mode() === TablePlan::EMPTY) {
+            if (!in_array($table, $existing, true)) {
+                continue;
+            }
+            if (in_array($plan->mode(), [TablePlan::EMPTY, TablePlan::CREDENTIALS], true)) {
                 $changed[$table] = $connection->delete($table)->rowCount();
             } elseif ($plan->mode() === TablePlan::MASK) {
-                $rules = array_filter($plan->columns(), static fn(Rule $rule): bool => !$rule->isKeep());
-                $changed[$table] = $rules === [] ? 0 : $this->rewrite($connection, $table, $rules);
+                $changed[$table] = $this->maskTable($connection, $plan);
             }
+        }
+        foreach ($this->plan()->afterMaskStatements() as $statement) {
+            $connection->execute($statement);
         }
         $this->turnOffOutbound($connection);
         $this->writeMarker($connection, self::TIER_MASK);
@@ -176,17 +179,46 @@ class DbSanitizer
      */
     public function rehearse(Connection $connection): array
     {
+        $existing = $connection->getSchemaCollection()->listTables();
         $changed = [];
         foreach ($this->plan()->tables() as $table => $plan) {
-            $secrets = array_filter($plan->columns(), static fn(Rule $rule): bool => $rule->isSecret());
-            if ($secrets !== []) {
-                $changed[$table] = $this->rewrite($connection, $table, $secrets);
+            if (!in_array($table, $existing, true)) {
+                continue;
+            }
+            if ($plan->mode() === TablePlan::CREDENTIALS) {
+                $changed[$table] = $connection->delete($table)->rowCount();
+                continue;
+            }
+            foreach ($plan->columns() as $column => $rule) {
+                if ($rule->isSecret()) {
+                    $changed[$table] = ($changed[$table] ?? 0) + $this->bulk($connection, $table, $column, $rule);
+                }
             }
         }
         $this->turnOffOutbound($connection);
         $this->writeMarker($connection, self::TIER_REHEARSE);
 
         return $changed;
+    }
+
+    /**
+     * Every column kept only until somebody reviews it, as `table.column`.
+     *
+     * @return array<int, string>
+     */
+    public function unreviewedColumns(): array
+    {
+        $columns = [];
+        foreach ($this->plan()->tables() as $table => $plan) {
+            foreach ($plan->columns() as $column => $rule) {
+                if ($rule->isUnreviewed()) {
+                    $columns[] = $table . '.' . $column;
+                }
+            }
+        }
+        sort($columns);
+
+        return $columns;
     }
 
     /**
@@ -228,7 +260,7 @@ class DbSanitizer
      * @param array<string, \RockSoftware\DbSanitizer\Rule> $rules The rules to apply.
      * @return int Rows changed.
      */
-    private function rewrite(Connection $connection, string $table, array $rules): int
+    private function rewrite(Connection $connection, string $table, array $rules, ?TablePlan $plan = null): int
     {
         $primaryKey = $connection->getSchemaCollection()->describe($table)->getPrimaryKey();
         if (count($primaryKey) !== 1) {
@@ -236,13 +268,18 @@ class DbSanitizer
         }
         $key = $primaryKey[0];
         $columns = array_keys($rules);
+        $read = array_values(array_unique(array_merge([$key], $columns, $plan?->usingColumns() ?? [])));
+        $conditions = self::conditions($connection, $plan?->conditions());
         $changed = 0;
         $last = null;
 
         do {
-            $query = $connection->selectQuery(array_merge([$key], $columns), $table)
+            $query = $connection->selectQuery($read, $table)
                 ->orderBy([$key => 'ASC'])
                 ->limit(self::CHUNK);
+            if ($conditions !== []) {
+                $query->where($conditions);
+            }
             if ($last !== null) {
                 $query->where([$key . ' >' => $last]);
             }
@@ -266,6 +303,81 @@ class DbSanitizer
         } while ($isFullChunk);
 
         return $changed;
+    }
+
+    /**
+     * One masked table: its bulk rules as one UPDATE each, then its
+     * row-by-row rules a chunk at a time.
+     *
+     * @param \Cake\Database\Connection $connection The copy.
+     * @param \RockSoftware\DbSanitizer\TablePlan $plan The table.
+     * @return int Rows changed, counted per statement.
+     */
+    private function maskTable(Connection $connection, TablePlan $plan): int
+    {
+        $changed = 0;
+        $rowRules = [];
+        foreach ($plan->columns() as $column => $rule) {
+            if ($rule->isKeep()) {
+                continue;
+            }
+            if ($rule->isBulk()) {
+                $changed += $this->bulk($connection, $plan->table, $column, $rule);
+            } else {
+                $rowRules[$column] = $rule;
+            }
+        }
+        if ($rowRules !== []) {
+            $changed += $this->rewrite($connection, $plan->table, $rowRules, $plan);
+        }
+
+        return $changed;
+    }
+
+    /**
+     * One rule over a whole table in one UPDATE.
+     *
+     * @param \Cake\Database\Connection $connection The copy.
+     * @param string $table The table.
+     * @param string $column The column.
+     * @param \RockSoftware\DbSanitizer\Rule $rule A bulk rule.
+     * @return int Rows changed.
+     */
+    private function bulk(Connection $connection, string $table, string $column, Rule $rule): int
+    {
+        $query = $connection->updateQuery($table);
+        $value = match ($rule->action) {
+            'expression' => new QueryExpression((string)$rule->argument),
+            'constant' => $rule->argument,
+            default => null,
+        };
+        $query->set($column, $value);
+        $conditions = self::conditions($connection, $rule->conditions);
+        if ($rule->action === 'expression') {
+            // Masking must not invent data where there was none.
+            $conditions[] = [$column . ' IS NOT' => null, $column . ' !=' => ''];
+        } elseif ($rule->action !== 'constant') {
+            $conditions[] = [$column . ' IS NOT' => null];
+        }
+        if ($conditions !== []) {
+            $query->where($conditions);
+        }
+
+        return $query->execute()->rowCount();
+    }
+
+    /**
+     * @param \Cake\Database\Connection $connection The copy.
+     * @param \Closure|array<string|int, mixed>|null $conditions The conditions.
+     * @return array<string|int, mixed>
+     */
+    private static function conditions(Connection $connection, Closure|array|null $conditions): array
+    {
+        if ($conditions instanceof Closure) {
+            return (array)$conditions($connection);
+        }
+
+        return $conditions ?? [];
     }
 
     /**
