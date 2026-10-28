@@ -5,7 +5,7 @@
     "keywords": ["cakephp", "database", "anonymization", "masking", "gdpr"],
     "license": "proprietary",
     "require": {
-        "php": ">=8.3",
+        "php": ">=8.2",
         "cakephp/cakephp": "^5.2",
         "cakephp/migrations": "^4.0 || ^5.0",
         "fakerphp/faker": "^1.23"
