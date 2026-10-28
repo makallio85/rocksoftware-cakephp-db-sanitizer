@@ -93,6 +93,8 @@ A null or empty value stays as it is under every rule but `constant()`. A table 
 | `$plan->credentialTables(...)` | Emptied by `mask` and `rehearse`: sessions, API tokens, links that open data without a login |
 | `$plan->table('x')->productionOnly()` | Exists in production but no migration creates it any more: masked when a dump carries it, never reported missing |
 
+**After-mask statements** (`$plan->afterMask($sql, ...)`) run once the rules are done, in `mask` only: for what a column rule cannot say, such as opening sign-in for a test login.
+
 **Outbound switches** (`OutboundSwitchInterface`) are whatever lets the application reach the outside: a sending setting, a scheduler, webhook endpoints. `mask` and `rehearse` both run them all. `new SqlOutboundSwitch($name, [$sql, ...])` covers the common case of a few statements.
 
 ## Safety

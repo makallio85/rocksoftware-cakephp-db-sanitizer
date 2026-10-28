@@ -20,6 +20,13 @@ final class SanitizerPlan
     private array $switches = [];
 
     /**
+     * SQL run by `mask` after every rule, before the switches.
+     *
+     * @var array<int, string>
+     */
+    private array $statements = [];
+
+    /**
      * Column types that can never hold personal data, so they need no rule.
      * Every other type does, in a masked table.
      *
@@ -96,6 +103,29 @@ final class SanitizerPlan
         }
 
         return $this;
+    }
+
+    /**
+     * SQL that `mask` runs after the rules, for what a column rule cannot say:
+     * opening sign-in for a test login, a row that must exist. Never run by
+     * `rehearse`. Written by the application, never from data.
+     *
+     * @param string ...$statements The statements, run in order.
+     * @return $this
+     */
+    public function afterMask(string ...$statements)
+    {
+        array_push($this->statements, ...$statements);
+
+        return $this;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    public function afterMaskStatements(): array
+    {
+        return $this->statements;
     }
 
     /**

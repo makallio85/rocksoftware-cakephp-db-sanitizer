@@ -160,6 +160,9 @@ class DbSanitizer
                 $changed[$table] = $this->maskTable($connection, $plan);
             }
         }
+        foreach ($this->plan()->afterMaskStatements() as $statement) {
+            $connection->execute($statement);
+        }
         $this->turnOffOutbound($connection);
         $this->writeMarker($connection, self::TIER_MASK);
 

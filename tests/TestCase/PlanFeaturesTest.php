@@ -130,6 +130,18 @@ class PlanFeaturesTest extends TestCase
         $this->assertSame([], (new DbSanitizer($plan))->coverageGaps($this->connection()));
     }
 
+    public function testStatementsAfterMaskRunOnlyInMask(): void
+    {
+        $plan = $this->plan();
+        $plan->afterMask("UPDATE orders SET status = 'reviewed'");
+
+        (new DbSanitizer($plan))->rehearse($this->connection());
+        $this->assertSame('open', $this->rows('SELECT status FROM orders WHERE id = 1')[0]['status']);
+
+        (new DbSanitizer($plan))->mask($this->connection());
+        $this->assertSame('reviewed', $this->rows('SELECT status FROM orders WHERE id = 1')[0]['status']);
+    }
+
     public function testAnSqlSwitchRunsItsStatements(): void
     {
         $plan = $this->plan();
