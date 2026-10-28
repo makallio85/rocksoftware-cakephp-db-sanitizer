@@ -1,0 +1,11 @@
+parameters:
+    level: 8
+    bootstrapFiles:
+        - vendor/cakephp/cakephp/src/functions.php
+        - tests/phpstan-constants.php
+    paths:
+        - src
+        - tests/TestCase
+        - tests/test_app/src
+    parallel:
+        maximumNumberOfProcesses: 2
