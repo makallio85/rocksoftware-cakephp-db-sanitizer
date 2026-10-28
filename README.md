@@ -44,7 +44,7 @@ Fakes are **deterministic**: the same original gives the same fake in every tabl
 
 ## Declaring
 
-Every table needs a declaration: kept, emptied or masked. In a masked table, every text column (`string`, `char`, `text`, `json`) needs a rule. Numbers, dates and booleans are kept unless a rule says otherwise.
+Every table needs a declaration: kept, emptied, emptied as credentials, or masked. In a masked table, every column needs a rule unless its type is safe: numbers, booleans, moments (`datetime`, `timestamp`, `time`) and `uuid` by default. A plain `date` is not safe, because it can be a birth date. `$plan->safeTypes(...)` replaces the list.
 
 ```php
 use RockSoftware\DbSanitizer\DeclarationsInterface;
@@ -78,11 +78,22 @@ class AppDeclarations implements DeclarationsInterface
 | `Rule::constant($value)` | Sets every row to the value |
 | `Rule::secret()` | Removes a credential (null); `rehearse` removes it too |
 | `Rule::fake(Rule::FULL_NAME)` | A deterministic fake: `FIRST_NAME`, `LAST_NAME`, `FULL_NAME`, `EMAIL` (on `example.test`, unique), `PHONE` (unique), `STREET_ADDRESS`, `POSTAL_CODE`, `CITY`, `COMPANY`, `TEXT`, `IDENTIFIER` (same shape: letters for letters, digits for digits) |
-| `Rule::custom(fn($value, $row, $faker) => …)` | Anything else |
+| `Rule::custom(fn($value, $row, $faker) => …)` | Anything else; `$row` holds the primary key, the masked columns and any `->using(...)` columns |
+| `Rule::expression("CONCAT('contact', id, '@example.test')")` | An SQL expression over the row, applied in one `UPDATE`: for tables too big to rewrite row by row |
+| `Rule::unreviewed()` | Kept until somebody decides; listed by `DbSanitizer::unreviewedColumns()` so a test can make sure the list only shrinks |
 
-A null or empty value stays as it is under every rule but `constant()`. A masked table needs a single-column primary key.
+Any bulk rule (`expression`, `constant`, `null`, `secret`) takes `->onlyWhere([...])`: a CakePHP conditions array, or `fn(Connection $c) => [...]` for a subquery. The row-by-row rules (`fake`, `custom`) follow the table's `->where([...])`.
 
-**Outbound switches** (`OutboundSwitchInterface`) are whatever lets the application reach the outside: a sending setting, a scheduler, webhook endpoints. `mask` and `rehearse` both run them all.
+A null or empty value stays as it is under every rule but `constant()`. A table with row-by-row rules needs a single-column primary key.
+
+| Table declaration | Does |
+|---|---|
+| `$plan->keepTables(...)` | Kept whole |
+| `$plan->emptyTables(...)` | Emptied by `mask` |
+| `$plan->credentialTables(...)` | Emptied by `mask` and `rehearse`: sessions, API tokens, links that open data without a login |
+| `$plan->table('x')->productionOnly()` | Exists in production but no migration creates it any more: masked when a dump carries it, never reported missing |
+
+**Outbound switches** (`OutboundSwitchInterface`) are whatever lets the application reach the outside: a sending setting, a scheduler, webhook endpoints. `mask` and `rehearse` both run them all. `new SqlOutboundSwitch($name, [$sql, ...])` covers the common case of a few statements.
 
 ## Safety
 

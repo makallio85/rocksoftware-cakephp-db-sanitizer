@@ -20,6 +20,27 @@ final class SanitizerPlan
     private array $switches = [];
 
     /**
+     * Column types that can never hold personal data, so they need no rule.
+     * Every other type does, in a masked table.
+     *
+     * @var array<int, string>
+     */
+    private array $safeTypes = self::DEFAULT_SAFE_TYPES;
+
+    /**
+     * The default: numbers, booleans and moments. A plain date is not among
+     * them, because a date can be a birth date.
+     *
+     * @var array<int, string>
+     */
+    public const DEFAULT_SAFE_TYPES = [
+        'integer', 'biginteger', 'smallinteger', 'tinyinteger',
+        'decimal', 'float', 'boolean',
+        'datetime', 'datetimefractional', 'timestamp', 'timestampfractional', 'timestamptimezone', 'time',
+        'uuid',
+    ];
+
+    /**
      * A table whose columns are masked; declare them on the returned plan.
      *
      * @param string $table The table.
@@ -59,6 +80,43 @@ final class SanitizerPlan
         }
 
         return $this;
+    }
+
+    /**
+     * Tables of live credentials: sessions, API tokens, links that open data
+     * without signing in. Emptied by `mask` and by `rehearse` alike.
+     *
+     * @param string ...$tables The tables.
+     * @return $this
+     */
+    public function credentialTables(string ...$tables)
+    {
+        foreach ($tables as $table) {
+            $this->table($table)->setMode(TablePlan::CREDENTIALS);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Replace the column types that need no rule.
+     *
+     * @param string ...$types CakePHP abstract column types.
+     * @return $this
+     */
+    public function safeTypes(string ...$types)
+    {
+        $this->safeTypes = array_values($types);
+
+        return $this;
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    public function safeTypeList(): array
+    {
+        return $this->safeTypes;
     }
 
     /**
