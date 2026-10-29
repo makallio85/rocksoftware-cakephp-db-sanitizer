@@ -9,7 +9,6 @@ use RockSoftware\DbSanitizer\Faker\DeterministicFaker;
 use RockSoftware\DbSanitizer\Rule;
 use RockSoftware\DbSanitizer\SanitizerPlan;
 use RockSoftware\DbSanitizer\TestSuite\DeclarationsCoverageTrait;
-use RuntimeException;
 
 class DbSanitizerTest extends TestCase
 {
@@ -95,17 +94,34 @@ class DbSanitizerTest extends TestCase
         );
     }
 
-    public function testMaskRefusesWhenTheDeclarationsHaveGaps(): void
+    public function testMaskEmptiesAndClearsWhatTheDeclarationsMissAndWarns(): void
+    {
+        $this->connection()->execute('CREATE TABLE extra (id INTEGER PRIMARY KEY, label VARCHAR(10))');
+        $this->connection()->execute("INSERT INTO extra (id, label) VALUES (1, 'Alex Example')");
+        $this->connection()->execute('ALTER TABLE customers ADD COLUMN nickname VARCHAR(30)');
+        $this->connection()->execute("UPDATE customers SET nickname = 'Lexi'");
+        $plan = DbSanitizer::planFromConfig();
+        $plan->keepTables('vanished');
+        $sanitizer = new DbSanitizer($plan);
+
+        $sanitizer->mask($this->connection());
+
+        $this->assertSame([], $this->rows('SELECT * FROM extra'), 'An undeclared table leaves the copy empty.');
+        $this->assertNull($this->rows('SELECT nickname FROM customers WHERE id = 1')[0]['nickname'], 'An undeclared text column is cleared.');
+        $this->assertNotSame('Alex Example', $this->rows('SELECT name FROM customers WHERE id = 1')[0]['name'], 'The rest is masked as declared.');
+        $this->assertSame('mask', $this->rows('SELECT tier FROM db_sanitizer_runs')[0]['tier']);
+        $this->assertEqualsCanonicalizing([
+            'Table "extra" has no declaration: keep, empty or mask it. Emptied.',
+            'Column "customers.nickname" (string) has no rule. Cleared.',
+            'Table "vanished" is declared but does not exist. Ignored.',
+        ], $sanitizer->warnings());
+    }
+
+    public function testCheckStillCountsDriftAsGaps(): void
     {
         $this->connection()->execute('CREATE TABLE extra (id INTEGER PRIMARY KEY, label VARCHAR(10))');
 
-        try {
-            (new DbSanitizer())->mask($this->connection());
-            $this->fail('Masked with an undeclared table.');
-        } catch (RuntimeException $e) {
-            $this->assertStringContainsString('Table "extra" has no declaration', $e->getMessage());
-        }
-        $this->assertSame('Alex Example', $this->rows('SELECT name FROM customers WHERE id = 1')[0]['name']);
+        $this->assertContains('Table "extra" has no declaration: keep, empty or mask it.', (new DbSanitizer())->coverageGaps($this->connection()));
     }
 
     public function testRehearseKeepsTheDataAndRemovesCredentials(): void

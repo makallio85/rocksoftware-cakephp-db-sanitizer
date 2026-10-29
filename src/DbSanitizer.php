@@ -80,6 +80,26 @@ class DbSanitizer
         return $this->plan;
     }
 
+    /** A table in the database with no declaration. */
+    public const GAP_UNDECLARED_TABLE = 'undeclared_table';
+
+    /** A text column of a masked table with no rule. */
+    public const GAP_UNRULED_COLUMN = 'unruled_column';
+
+    /** A declared column the table does not have. */
+    public const GAP_MISSING_COLUMN = 'missing_column';
+
+    /** A declared table the database does not have. */
+    public const GAP_MISSING_TABLE = 'missing_table';
+
+    /**
+     * What `mask` did about the gaps of the last copy it masked, one sentence
+     * each.
+     *
+     * @var array<int, string>
+     */
+    private array $warnings = [];
+
     /**
      * What the declarations miss or no longer match, one sentence each; empty
      * when every table and every text column of a masked table is declared.
@@ -89,6 +109,17 @@ class DbSanitizer
      */
     public function coverageGaps(Connection $connection): array
     {
+        return array_column($this->coverageFindings($connection), 'message');
+    }
+
+    /**
+     * {@see self::coverageGaps()} with what each gap is about.
+     *
+     * @param \Cake\Database\Connection $connection The database.
+     * @return array<int, array{type: string, table: string, column: string|null, message: string}>
+     */
+    public function coverageFindings(Connection $connection): array
+    {
         $schema = $connection->getSchemaCollection();
         $existing = array_filter(
             $schema->listTables(),
@@ -96,10 +127,21 @@ class DbSanitizer
         );
         $declared = $this->plan()->tables();
         $gaps = [];
+        $gap = static fn(string $type, string $table, ?string $column, string $message): array => [
+            'type' => $type,
+            'table' => $table,
+            'column' => $column,
+            'message' => $message,
+        ];
 
         foreach ($existing as $table) {
             if (!isset($declared[$table])) {
-                $gaps[] = sprintf('Table "%s" has no declaration: keep, empty or mask it.', $table);
+                $gaps[] = $gap(
+                    self::GAP_UNDECLARED_TABLE,
+                    $table,
+                    null,
+                    sprintf('Table "%s" has no declaration: keep, empty or mask it.', $table),
+                );
                 continue;
             }
             if ($declared[$table]->mode() !== TablePlan::MASK) {
@@ -113,18 +155,33 @@ class DbSanitizer
                 $type = (string)$describe->getColumnType($column);
                 $needsRule = !in_array($type, $safeTypes, true) && !in_array($column, $primaryKey, true);
                 if (!isset($rules[$column]) && $needsRule) {
-                    $gaps[] = sprintf('Column "%s.%s" (%s) has no rule.', $table, $column, $type);
+                    $gaps[] = $gap(
+                        self::GAP_UNRULED_COLUMN,
+                        $table,
+                        $column,
+                        sprintf('Column "%s.%s" (%s) has no rule.', $table, $column, $type),
+                    );
                 }
             }
             foreach (array_keys($rules) as $column) {
                 if (!$describe->hasColumn($column)) {
-                    $gaps[] = sprintf('Column "%s.%s" is declared but does not exist.', $table, $column);
+                    $gaps[] = $gap(
+                        self::GAP_MISSING_COLUMN,
+                        $table,
+                        $column,
+                        sprintf('Column "%s.%s" is declared but does not exist.', $table, $column),
+                    );
                 }
             }
         }
         foreach ($declared as $table => $plan) {
             if (!in_array($table, $existing, true) && !$plan->isProductionOnly()) {
-                $gaps[] = sprintf('Table "%s" is declared but does not exist.', $table);
+                $gaps[] = $gap(
+                    self::GAP_MISSING_TABLE,
+                    $table,
+                    null,
+                    sprintf('Table "%s" is declared but does not exist.', $table),
+                );
             }
         }
 
@@ -132,24 +189,54 @@ class DbSanitizer
     }
 
     /**
+     * What the last {@see self::mask()} did about the copy's gaps: each
+     * undeclared table emptied, each text column without a rule cleared, each
+     * declaration the copy does not match. Every one means a declaration to
+     * add or a migration to write.
+     *
+     * @return array<int, string>
+     */
+    public function warnings(): array
+    {
+        return $this->warnings;
+    }
+
+    /**
      * Replace every personal field, empty what is declared empty, turn off
      * every outbound switch, and write the `mask` marker.
      *
+     * A copy whose schema the declarations do not match is masked all the
+     * same, and nothing undeclared leaves it: a table with no declaration is
+     * emptied and a text column without a rule is cleared. Each such gap, and
+     * each declaration the copy lacks, is a warning ({@see self::warnings()}).
+     *
      * @param \Cake\Database\Connection $connection The throwaway copy.
      * @return array<string, int> Rows changed per table.
-     * @throws \RuntimeException When the declarations do not cover the schema.
      */
     public function mask(Connection $connection): array
     {
-        $gaps = $this->coverageGaps($connection);
-        if ($gaps !== []) {
-            throw new RuntimeException(
-                "Not masked: the declarations do not cover the schema.\n" . implode("\n", $gaps),
-            );
-        }
+        $this->warnings = [];
+        $changed = [];
+        $gaps = $this->coverageFindings($connection);
+        // Undeclared tables are often a forgotten feature's, pointing at each
+        // other in an order nothing records.
+        $connection->disableConstraints(function () use ($connection, $gaps, &$changed): void {
+            foreach ($gaps as $gap) {
+                $this->warnings[] = $gap['message'] . match ($gap['type']) {
+                    self::GAP_UNDECLARED_TABLE => ' Emptied.',
+                    self::GAP_UNRULED_COLUMN => ' Cleared.',
+                    default => ' Ignored.',
+                };
+                if ($gap['type'] === self::GAP_UNDECLARED_TABLE) {
+                    $changed[$gap['table']] = $connection->delete($gap['table'])->rowCount();
+                } elseif ($gap['type'] === self::GAP_UNRULED_COLUMN) {
+                    $changed[$gap['table']] = ($changed[$gap['table']] ?? 0)
+                        + $this->clearColumn($connection, $gap['table'], (string)$gap['column']);
+                }
+            }
+        });
 
         $existing = $connection->getSchemaCollection()->listTables();
-        $changed = [];
         foreach ($this->plan()->tables() as $table => $plan) {
             if (!in_array($table, $existing, true)) {
                 continue;
@@ -157,7 +244,7 @@ class DbSanitizer
             if (in_array($plan->mode(), [TablePlan::EMPTY, TablePlan::CREDENTIALS], true)) {
                 $changed[$table] = $connection->delete($table)->rowCount();
             } elseif ($plan->mode() === TablePlan::MASK) {
-                $changed[$table] = $this->maskTable($connection, $plan);
+                $changed[$table] = ($changed[$table] ?? 0) + $this->maskTable($connection, $plan);
             }
         }
         foreach ($this->plan()->afterMaskStatements() as $statement) {
@@ -332,6 +419,25 @@ class DbSanitizer
         }
 
         return $changed;
+    }
+
+    /**
+     * A text column no rule covers, emptied in every row: NULL where the
+     * column allows it, an empty string otherwise.
+     *
+     * @param \Cake\Database\Connection $connection The copy.
+     * @param string $table The table.
+     * @param string $column The column.
+     * @return int Rows changed.
+     */
+    private function clearColumn(Connection $connection, string $table, string $column): int
+    {
+        $isNullable = (bool)($connection->getSchemaCollection()->describe($table)->getColumn($column)['null'] ?? false);
+
+        return $connection->updateQuery($table)
+            ->set($column, $isNullable ? null : '')
+            ->execute()
+            ->rowCount();
     }
 
     /**
