@@ -5,6 +5,7 @@ A CakePHP 5 plugin for copies of a production database.
 - **`mask`** turns a copy into one fit for development. Every personal field gets a realistic fake, credentials are removed, and everything that reaches the outside is switched off.
 - **`rehearse`** prepares a copy for a release rehearsal. Real data is kept, credentials are removed, and the outside is switched off.
 - **`check`** fails when a table, or a text column of a masked table, has no declaration. A schema change therefore cannot forget the masking.
+- **Schema drift does not stop `mask`.** A production database can carry what the code no longer declares (a forgotten table, a column added by hand) or lack what it does. `mask` still masks it, and nothing undeclared leaves the copy: a table with no declaration is emptied and a text column without a rule is cleared. Each gap is printed as a *schema drift* warning naming the declaration or migration that is due. `check` and the coverage test stay strict.
 - **`verify <dump>`** succeeds only for a dump that `mask` produced. Import scripts call it before restoring anything.
 
 Fakes are **deterministic**: the same original gives the same fake in every table and every run with the same key, so relations, searches and duplicates still behave. Without the key (the production salt, by default) a fake cannot be traced back by guessing originals.
@@ -100,5 +101,7 @@ A null or empty value stays as it is under every rule but `constant()`. A table 
 ## Safety
 
 `mask` and `rehearse` rewrite the database they run against. They refuse to run unless `DB_SANITIZER_THROWAWAY=yes` is set, which only the script that builds a throwaway copy sets. Run them on a restored copy, never on production.
+
+What the declarations miss is never copied: `mask` empties an undeclared table and clears an undeclared text column before it masks the rest, and warns about each (`DbSanitizer::warnings()`).
 
 A raw dump of production carries an empty `db_sanitizer_runs`. Only `mask` writes a `mask` row, which is what `verify` looks for.

@@ -117,6 +117,18 @@ class DbSanitizerCommand extends Command
         foreach ($sanitizer->plan()->switches() as $switch) {
             $io->out(sprintf('Turned off: %s', $switch->name()));
         }
+        // The copy is masked; what it lacked or carried beyond the
+        // declarations still needs a declaration or a migration.
+        foreach ($sanitizer->warnings() as $warning) {
+            $io->warning('Schema drift: ' . $warning);
+        }
+        if ($sanitizer->warnings() !== []) {
+            $io->warning(sprintf(
+                '%d schema drift warnings: add the declarations, or a migration that drops'
+                . ' what production no longer needs.',
+                count($sanitizer->warnings()),
+            ));
+        }
         $io->success(sprintf('Done: %s.', $action));
 
         return self::CODE_SUCCESS;
